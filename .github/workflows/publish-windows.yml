@@ -1,0 +1,72 @@
+name: Publish verified Windows release
+on:
+  workflow_dispatch:
+    inputs:
+      artifact_url:
+        description: Temporary read-only GitHub Actions artifact download URL
+        required: true
+      version:
+        description: Stable numeric version, for example 0.2.2
+        required: true
+      source_run:
+        description: Successful private Windows build run ID
+        required: true
+permissions:
+  contents: write
+concurrency:
+  group: windows-release-publishing
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download and validate only the three Windows release files
+        env:
+          ARTIFACT_URL: ${{ inputs.artifact_url }}
+          VERSION: ${{ inputs.version }}
+          SOURCE_RUN: ${{ inputs.source_run }}
+        run: |
+          printf '::add-mask::%s\n' "$ARTIFACT_URL"
+          python3 -m venv .publish-env
+          .publish-env/bin/pip install --quiet --disable-pip-version-check PyYAML==6.0.2
+          .publish-env/bin/python - <<'PY'
+          import os,re,urllib.request,urllib.parse,zipfile,hashlib,base64,pathlib,shutil,stat,yaml
+          version=os.environ['VERSION']
+          if not re.fullmatch(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)',version): raise SystemExit('Invalid stable version')
+          url=urllib.parse.urlparse(os.environ['ARTIFACT_URL'])
+          if url.scheme!='https' or url.username or url.password or url.port or not re.fullmatch(r'productionresultssa[0-9]+\.blob\.core\.windows\.net',url.hostname or ''): raise SystemExit('Invalid GitHub artifact source')
+          with urllib.request.urlopen(os.environ['ARTIFACT_URL'],timeout=120) as response,open('installer-artifact.zip','wb') as target: shutil.copyfileobj(response,target)
+          filename=f'Anro-Metadata-Importer-{version}-x64-Setup.exe'
+          expected={filename,filename+'.blockmap','latest.yml'}
+          folder=pathlib.Path('release-assets');folder.mkdir()
+          with zipfile.ZipFile('installer-artifact.zip') as archive:
+            infos=archive.infolist()
+            if len(infos)!=3 or {i.filename for i in infos}!=expected or any(i.is_dir() or stat.S_ISLNK(i.external_attr>>16) for i in infos): raise SystemExit('Unexpected artifact contents')
+            for info in infos:
+              with archive.open(info) as source,(folder/info.filename).open('wb') as target: shutil.copyfileobj(source,target)
+          metadata=yaml.safe_load((folder/'latest.yml').read_text())
+          files=metadata.get('files',[])
+          if metadata.get('version')!=version or len(files)!=1 or files[0].get('url')!=filename or metadata.get('path',filename)!=filename: raise SystemExit('Version or filename mismatch')
+          installer=folder/filename
+          with installer.open('rb') as source: digest=base64.b64encode(hashlib.file_digest(source,'sha512').digest()).decode()
+          if files[0].get('sha512')!=digest or metadata.get('sha512',digest)!=digest or files[0].get('size')!=installer.stat().st_size: raise SystemExit('Installer integrity mismatch')
+          print('Validated installer, blockmap and latest.yml for version '+version)
+          PY
+      - name: Publish a complete release with the repository-scoped GitHub token
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+          SOURCE_RUN: ${{ inputs.source_run }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" > existing-releases.json
+          python3 - <<'PY'
+          import os,json,re
+          current=tuple(map(int,os.environ['VERSION'].split('.')))
+          for release in json.load(open('existing-releases.json')):
+            tag=release['tag_name'].removeprefix('v')
+            if tag==os.environ['VERSION']: raise SystemExit('Release already exists; never overwrite a release')
+            if not release['draft'] and not release['prerelease'] and re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+',tag) and tuple(map(int,tag.split('.'))) >= current: raise SystemExit('Publish a higher release version')
+          PY
+          printf 'Windows x64-release %s. Build %s passed the private Windows workflow. Local accounts, databases and encrypted CCV settings remain on the PC. No client token is required.\n' "$VERSION" "$SOURCE_RUN" > release-notes.md
+          gh release create "v$VERSION" "release-assets/Anro-Metadata-Importer-$VERSION-x64-Setup.exe" "release-assets/Anro-Metadata-Importer-$VERSION-x64-Setup.exe.blockmap" release-assets/latest.yml --repo "$GITHUB_REPOSITORY" --draft --title "Anro Metadata Importer $VERSION" --notes-file release-notes.md
+          gh release edit "v$VERSION" --repo "$GITHUB_REPOSITORY" --draft=false --latest
